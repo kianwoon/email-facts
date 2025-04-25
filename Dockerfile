@@ -23,7 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY rag.py .
 
 # Expose the port the app runs on (matching rag.py)
-EXPOSE 8000
+EXPOSE 8080
 
 # Command to run the application (matching rag.py)
-CMD ["uvicorn", "rag:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "rag:app", "--host", "0.0.0.0", "--port", "8080"]

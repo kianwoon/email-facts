@@ -14,18 +14,20 @@ from typing import List, Dict, Any
 load_dotenv()
 
 # Configuration
-R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+# Read variables using the names set in Koyeb
+R2_ENDPOINT_URL = os.getenv("AWS_S3_ENDPOINT")
+R2_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 DUCKDB_S3_REGION = os.getenv("DUCKDB_S3_REGION", "auto") # Default to auto if not set
 ICEBERG_CATALOG_NAME = "my_iceberg_data" # Or any logical name
-ICEBERG_WAREHOUSE_PATH = f"s3://{os.getenv('R2_BUCKET_NAME')}/{ICEBERG_CATALOG_NAME}" # Base path for tables
+# Use the AWS_S3_BUCKET variable from Koyeb
+ICEBERG_WAREHOUSE_PATH = f"s3://{os.getenv('AWS_S3_BUCKET')}/{ICEBERG_CATALOG_NAME}" # Base path for tables
 
 # Define the Iceberg table schema
 iceberg_schema = Schema(
-    NestedField(field_id=1, name="id", field_type=StringType(), is_required=True),
-    NestedField(field_id=2, name="fact", field_type=StringType(), is_required=True),
-    NestedField(field_id=3, name="source", field_type=StringType(), is_required=False),
+    NestedField(field_id=1, name="id", field_type=StringType(), required=True),
+    NestedField(field_id=2, name="fact", field_type=StringType(), required=True),
+    NestedField(field_id=3, name="source", field_type=StringType(), required=False),
     schema_id=1,
     identifier_field_ids=[1]
 )
@@ -225,4 +227,4 @@ if __name__ == "__main__":
     import uvicorn
     # Check if running in Docker or locally for host binding
     host = os.getenv("DOCKER_HOST", "127.0.0.1") # Default to localhost if not in Docker
-    uvicorn.run(app, host=host, port=8000)
+    uvicorn.run(app, host=host, port=8080)
