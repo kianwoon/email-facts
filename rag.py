@@ -40,12 +40,7 @@ CREATE TABLE IF NOT EXISTS email_facts (
   detected_pii_types VARCHAR[],
   generated_summary VARCHAR,
   extracted_key_points VARCHAR[],
-  -- Temporarily commented out for debugging
-  -- extracted_entities STRUCT{{
-  --   persons: VARCHAR[],
-  --   organizations: VARCHAR[],
-  --   locations: VARCHAR[]
-  -- }},
+  -- extracted_entities column commented out for debugging
   intent VARCHAR,
   extraction_method VARCHAR,
   extraction_timestamp TIMESTAMP
