@@ -10,6 +10,15 @@ from pyiceberg.types import NestedField, StringType, IntegerType
 from dotenv import load_dotenv
 from typing import List, Dict, Any
 
+# --- Debugging Environment Variables ---
+print("--- Environment Variable Debug --- ")
+print(f"AWS_S3_ENDPOINT: {os.getenv('AWS_S3_ENDPOINT')}")
+print(f"AWS_ACCESS_KEY_ID: {'<present>' if os.getenv('AWS_ACCESS_KEY_ID') else '<None>'}") # Don't log the actual key
+print(f"AWS_SECRET_ACCESS_KEY: {'<present>' if os.getenv('AWS_SECRET_ACCESS_KEY') else '<None>'}") # Don't log the actual secret
+print(f"AWS_S3_BUCKET: {os.getenv('AWS_S3_BUCKET')}")
+print(f"DUCKDB_S3_REGION: {os.getenv('DUCKDB_S3_REGION')}")
+print("--------------------------------")
+
 # Load environment variables
 load_dotenv()
 
@@ -61,8 +70,8 @@ def ensure_iceberg_table(table_name: str, schema: Schema):
         "s3.endpoint": R2_ENDPOINT_URL,
         "s3.access-key-id": R2_ACCESS_KEY_ID,
         "s3.secret-access-key": R2_SECRET_ACCESS_KEY,
-        # Ensure no 'type' or explicit catalog 'uri' is set here
-        # Let pyiceberg infer S3FileIO from the 'warehouse' path
+        # Explicitly tell pyiceberg how to interact with the file system (S3)
+        "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
     }
 
     try:
