@@ -1,11 +1,13 @@
 # Dockerfile
 FROM python:3.11-slim
 
-# 1) Install DuckDB (with Iceberg & HTTPFS bundled), FastAPI, Uvicorn
+# 1) Install DuckDB (with Iceberg & HTTPFS bundled), FastAPI, Uvicorn, PyIceberg, S3FS
 RUN pip install --no-cache-dir \
       duckdb \
       fastapi \
-      uvicorn
+      uvicorn \
+      pyiceberg \
+      s3fs
 
 # 2) Copy your app
 WORKDIR /app
