@@ -9,6 +9,12 @@ from pyiceberg.schema import Schema
 from pyiceberg.types import NestedField, StringType, IntegerType
 from dotenv import load_dotenv
 from typing import List, Dict, Any
+import uuid
+from pyiceberg.io import load_file_io
+from pyiceberg.table import Table, PartitionSpec, SortOrder, UNPARTITIONED_PARTITION_SPEC, UNSORTED_SORT_ORDER
+from pyiceberg.table.metadata import TableMetadata, new_table_metadata
+from pyiceberg.serializers import ToOutputFile
+from pyiceberg.exceptions import NoSuchPropertyException
 
 # --- Debugging Environment Variables ---
 print("--- Environment Variable Debug --- ")
@@ -62,40 +68,94 @@ def get_duckdb_connection():
 
 # Function to ensure the Iceberg table exists, loading or creating it via pyiceberg
 def ensure_iceberg_table(table_name: str, schema: Schema):
-    """Loads or creates the Iceberg table using pyiceberg."""
-    table_identifier = f"{ICEBERG_CATALOG_NAME}.{table_name}" # Fully qualified identifier for pyiceberg catalog
-
-    properties = {
-        "warehouse": ICEBERG_WAREHOUSE_PATH,
+    """Loads or creates the Iceberg table by directly interacting with S3 metadata."""
+    print(f"Ensuring Iceberg table '{table_name}' via direct FileIO...")
+    s3_properties = {
         "s3.endpoint": R2_ENDPOINT_URL,
         "s3.access-key-id": R2_ACCESS_KEY_ID,
         "s3.secret-access-key": R2_SECRET_ACCESS_KEY,
-        # Explicitly tell pyiceberg how to interact with the file system (S3)
-        "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
+        "warehouse": ICEBERG_WAREHOUSE_PATH,
     }
 
+    s3_io = None # Define s3_io before the try block
     try:
-        print(f"Attempting to load catalog with properties: {properties}")
-        # Catalog name 'default' is arbitrary here, properties drive behavior
-        catalog = load_catalog("default", **properties)
-        print(f"Catalog loaded. Attempting to load table: {table_identifier}")
-        table = catalog.load_table(table_identifier)
-        print(f"Table '{table_identifier}' loaded successfully.")
+        s3_io = load_file_io(properties=s3_properties)
+        print("S3 FileIO loaded.")
+    except Exception as e:
+        print(f"Error loading S3 FileIO: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize S3 connection: {e}")
+
+    table_location = f"{ICEBERG_WAREHOUSE_PATH}/{table_name}"
+    metadata_dir = f"{table_location}/metadata"
+    version_hint_path = f"{metadata_dir}/version-hint.text"
+    table_identifier = (ICEBERG_CATALOG_NAME, table_name) # Identifier tuple
+
+    try:
+        print(f"Attempting to read version hint file: {version_hint_path}")
+        # Get the PyArrow input file object
+        input_file = s3_io.new_input(version_hint_path)
+        # Access the underlying PyArrow stream and read all bytes
+        input_stream = input_file.open()
+        _ = input_stream.readall()
+        input_stream.close() # Close the stream
+        print(f"Version hint found and readable. Attempting to load table from location: {table_location}")
+        table = Table.load(table_location, io=s3_io)
+        print(f"Table '{table_identifier}' loaded successfully from {table_location}.")
         return table
-    except NoSuchTableError:
-        print(f"Table '{table_identifier}' not found. Attempting to create...")
-        try:
-            # Re-ensure catalog is loaded before create attempt within this block
-            catalog = load_catalog("default", **properties)
-            table = catalog.create_table(identifier=table_identifier, schema=schema)
-            print(f"Table '{table_identifier}' created successfully.")
-            return table
-        except Exception as create_e:
-            print(f"Error creating table '{table_identifier}': {create_e}")
-            raise HTTPException(status_code=500, detail=f"Failed to create Iceberg table: {create_e}")
-    except Exception as load_e:
-        print(f"Error loading catalog or table '{table_identifier}': {load_e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load Iceberg table/catalog: {load_e}")
+
+    except FileNotFoundError:
+        print(f"Version hint not found at {version_hint_path}. Table does not exist. Will attempt creation.")
+    except Exception as load_err: # Catch other potential load errors
+         print(f"Error loading table '{table_identifier}' (or reading hint): {load_err}. Will attempt creation.")
+
+    # --- Creation Block --- (Only reached if loading fails)
+    print(f"Attempting to create table '{table_identifier}' at {table_location}...")
+    try:
+        # 1. Create initial metadata object
+        metadata = new_table_metadata(
+            location=table_location,
+            schema=schema,
+            partition_spec=UNPARTITIONED_PARTITION_SPEC,
+            sort_order=UNSORTED_SORT_ORDER,
+            properties={}
+        )
+        print("Initial metadata object created.")
+
+        # 2. Define path for the first metadata file
+        metadata_file_path = f"{metadata_dir}/00000-{uuid.uuid4()}.metadata.json"
+        print(f"Writing initial metadata to: {metadata_file_path}")
+
+        # 3. Write the first metadata file (no context manager)
+        metadata_output_file = s3_io.new_output(metadata_file_path)
+        # ToOutputFile likely expects a file-like object supporting .write()
+        # Let's try opening the stream from the output file object
+        metadata_output_stream = metadata_output_file.create()
+        ToOutputFile.table_metadata(metadata, metadata_output_stream)
+        metadata_output_stream.close() # Close the stream
+        print("Metadata file written.")
+
+        # 4. Write the version hint file pointing to version 0 (no context manager)
+        print(f"Writing version hint file: {version_hint_path}")
+        hint_output_file = s3_io.new_output(version_hint_path)
+        # Open the stream, write bytes, and close
+        hint_output_stream = hint_output_file.create()
+        hint_output_stream.write(b"0\n")
+        hint_output_stream.close() # IMPORTANT: Explicitly close the output stream
+        print("Version hint file written and closed.")
+
+        # 5. Instantiate the Table object
+        table = Table(
+            identifier=table_identifier,
+            metadata=metadata,
+            metadata_location=metadata_file_path,
+            io=s3_io,
+        )
+        print(f"Table '{table_identifier}' created and instantiated successfully.")
+        return table
+
+    except Exception as create_e:
+        print(f"Error during table creation process: {create_e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create Iceberg table: {create_e}")
 
 
 # Initialize FastAPI app
