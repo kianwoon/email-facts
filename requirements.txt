@@ -1,5 +1,5 @@
 fastapi
 uvicorn[standard]
-pyiceberg[s3fs,pyarrow]
-duckdb>=0.10.0
+pyiceberg[s3fs,pyarrow,sql-sqlite]
+duckdb==1.2.2
 python-dotenv 
