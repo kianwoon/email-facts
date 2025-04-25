@@ -1,159 +1,228 @@
 # rag.py
 import os
 import duckdb
-from fastapi import FastAPI
-
-# Import PyIceberg components
-# from pyiceberg.catalog import load_catalog # No longer needed
-# from pyiceberg.exceptions import NamespaceAlreadyExistsError, TableAlreadyExistsError # Less relevant now
-from pyiceberg.exceptions import CommitFailedException
-from pyiceberg.io import load_file_io
+import pyarrow as pa
+from fastapi import FastAPI, HTTPException, Body
+from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.schema import Schema
-from pyiceberg.table import Table
-from pyiceberg.types import (
-    ListType,
-    NestedField,
-    StringType,
-    StructType,
-    TimestampType,
-    BooleanType
+from pyiceberg.types import NestedField, StringType, IntegerType
+from dotenv import load_dotenv
+from typing import List, Dict, Any
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+DUCKDB_S3_REGION = os.getenv("DUCKDB_S3_REGION", "auto") # Default to auto if not set
+ICEBERG_CATALOG_NAME = "my_iceberg_data" # Or any logical name
+ICEBERG_WAREHOUSE_PATH = f"s3://{os.getenv('R2_BUCKET_NAME')}/{ICEBERG_CATALOG_NAME}" # Base path for tables
+
+# Define the Iceberg table schema
+iceberg_schema = Schema(
+    NestedField(field_id=1, name="id", field_type=StringType(), is_required=True),
+    NestedField(field_id=2, name="fact", field_type=StringType(), is_required=True),
+    NestedField(field_id=3, name="source", field_type=StringType(), is_required=False),
+    schema_id=1,
+    identifier_field_ids=[1]
 )
 
+# Function to initialize DuckDB connection with Iceberg and S3 extensions
+def get_duckdb_connection():
+    con = duckdb.connect(database=':memory:', read_only=False)
+    try:
+        con.sql("INSTALL iceberg;")
+        con.sql("LOAD iceberg;")
+        con.sql("INSTALL httpfs;") # Required for S3 access
+        con.sql("LOAD httpfs;")
+        # Configure S3 credentials for DuckDB
+        con.sql(f"SET s3_endpoint='{R2_ENDPOINT_URL}';")
+        con.sql(f"SET s3_access_key_id='{R2_ACCESS_KEY_ID}';")
+        con.sql(f"SET s3_secret_access_key='{R2_SECRET_ACCESS_KEY}';")
+        con.sql("SET s3_use_ssl=true;")
+        con.sql(f"SET s3_region='{DUCKDB_S3_REGION}';") # Use region from env or 'auto'
+    except Exception as e:
+        print(f"Error initializing DuckDB extensions or S3 config: {e}")
+        raise
+    return con
+
+# Function to ensure the Iceberg table exists, loading or creating it via pyiceberg
+def ensure_iceberg_table(table_name: str, schema: Schema):
+    """Loads or creates the Iceberg table using pyiceberg."""
+    table_identifier = f"{ICEBERG_CATALOG_NAME}.{table_name}" # Fully qualified identifier for pyiceberg catalog
+
+    properties = {
+        "warehouse": ICEBERG_WAREHOUSE_PATH,
+        "s3.endpoint": R2_ENDPOINT_URL,
+        "s3.access-key-id": R2_ACCESS_KEY_ID,
+        "s3.secret-access-key": R2_SECRET_ACCESS_KEY,
+        # Ensure no 'type' or explicit catalog 'uri' is set here
+        # Let pyiceberg infer S3FileIO from the 'warehouse' path
+    }
+
+    try:
+        print(f"Attempting to load catalog with properties: {properties}")
+        # Catalog name 'default' is arbitrary here, properties drive behavior
+        catalog = load_catalog("default", **properties)
+        print(f"Catalog loaded. Attempting to load table: {table_identifier}")
+        table = catalog.load_table(table_identifier)
+        print(f"Table '{table_identifier}' loaded successfully.")
+        return table
+    except NoSuchTableError:
+        print(f"Table '{table_identifier}' not found. Attempting to create...")
+        try:
+            # Re-ensure catalog is loaded before create attempt within this block
+            catalog = load_catalog("default", **properties)
+            table = catalog.create_table(identifier=table_identifier, schema=schema)
+            print(f"Table '{table_identifier}' created successfully.")
+            return table
+        except Exception as create_e:
+            print(f"Error creating table '{table_identifier}': {create_e}")
+            raise HTTPException(status_code=500, detail=f"Failed to create Iceberg table: {create_e}")
+    except Exception as load_e:
+        print(f"Error loading catalog or table '{table_identifier}': {load_e}")
+        raise HTTPException(status_code=500, detail=f"Failed to load Iceberg table/catalog: {load_e}")
+
+
+# Initialize FastAPI app
 app = FastAPI()
 
-# --- PyIceberg Table Creation/Verification --- 
-def ensure_iceberg_table():
-    s3_endpoint = os.environ['AWS_S3_ENDPOINT']
-    s3_bucket = os.environ["AWS_S3_BUCKET"]
-    aws_access_key_id = os.environ['AWS_ACCESS_KEY_ID']
-    aws_secret_access_key = os.environ['AWS_SECRET_ACCESS_KEY']
+# --- Globals ---
+# Initialize DuckDB connection and ensure table at startup (or handle errors)
+# Store connection and table reference globally if needed, or manage per-request
+try:
+    print("Initializing DuckDB connection...")
+    db_conn = get_duckdb_connection()
+    print("DuckDB connection initialized.")
+    print("Ensuring Iceberg table 'email_facts' exists...")
+    email_facts_table = ensure_iceberg_table("email_facts", iceberg_schema)
+    print("Iceberg table 'email_facts' ensured.")
+    # Keep connection open if desired, or close and reopen per request
+except Exception as startup_e:
+    print(f"FATAL: Startup failed: {startup_e}")
+    # You might want to exit or prevent the app from fully starting
+    # For now, we'll let FastAPI start but endpoints might fail if db_conn/table is None
+    db_conn = None
+    email_facts_table = None
+    # raise # Optionally re-raise to prevent server start on critical failure
 
-    # Define S3 File IO properties directly
-    s3_io_props = {
-        "s3.endpoint": s3_endpoint,
-        "s3.access-key-id": aws_access_key_id,
-        "s3.secret-access-key": aws_secret_access_key,
-        # Add region if needed
-        # "s3.region": "auto",
-    }
-    # Load the appropriate FileIO using properties
-    print("Loading S3 FileIO...")
-    s3_io = load_file_io(properties=s3_io_props)
+# --- API Endpoints ---
 
-    # Define the Iceberg schema using PyIceberg types
-    # (Keeping the full schema definition)
-    iceberg_schema = Schema(
-        NestedField(1, "email_id", StringType(), required=False),
-        NestedField(2, "message_id", StringType(), required=False),
-        NestedField(3, "subject", StringType(), required=False),
-        NestedField(4, "sender_name", StringType(), required=False),
-        NestedField(5, "sender_address", StringType(), required=False),
-        NestedField(6, "recipient_addresses", ListType(element_id=7, element_type=StringType(), element_required=False), required=False),
-        NestedField(8, "cc_addresses", ListType(element_id=9, element_type=StringType(), element_required=False), required=False),
-        NestedField(10, "received_at", TimestampType(), required=False),
-        NestedField(11, "importance", StringType(), required=False),
-        NestedField(12, "sensitivity_level", StringType(), required=False),
-        NestedField(13, "assigned_department", StringType(), required=False),
-        NestedField(14, "content_tags", ListType(element_id=15, element_type=StringType(), element_required=False), required=False),
-        NestedField(16, "is_private_content", BooleanType(), required=False),
-        NestedField(17, "detected_pii_types", ListType(element_id=18, element_type=StringType(), element_required=False), required=False),
-        NestedField(19, "generated_summary", StringType(), required=False),
-        NestedField(20, "extracted_key_points", ListType(element_id=21, element_type=StringType(), element_required=False), required=False),
-        NestedField(22, "extracted_entities", StructType(
-            NestedField(23, "persons", ListType(element_id=24, element_type=StringType(), element_required=False), required=False),
-            NestedField(25, "organizations", ListType(element_id=26, element_type=StringType(), element_required=False), required=False),
-            NestedField(27, "locations", ListType(element_id=28, element_type=StringType(), element_required=False), required=False),
-        ), required=False),
-        NestedField(29, "intent", StringType(), required=False),
-        NestedField(30, "extraction_method", StringType(), required=False),
-        NestedField(31, "extraction_timestamp", TimestampType(), required=False),
-        schema_id=1
-    )
+@app.post("/add_fact")
+async def add_fact(fact_data: Dict[str, Any] = Body(...)):
+    """Adds a new fact to the Iceberg table."""
+    if not db_conn or not email_facts_table:
+        raise HTTPException(status_code=500, detail="Database/Table not initialized")
 
+    required_keys = ["id", "fact"]
+    if not all(key in fact_data for key in required_keys):
+        raise HTTPException(status_code=400, detail="Missing required keys: id, fact")
+
+    # Prepare data for append (ensure correct types if necessary)
+    # PyIceberg append usually works with list of dicts or Arrow table/dataframe
+    data_to_append = [fact_data] # Append as a single row
+
+    try:
+        print(f"Appending data: {data_to_append}")
+        # Use pyiceberg table object to append
+        email_facts_table.append(data_to_append)
+        print("Data appended successfully via pyiceberg.")
+
+        # Optional: Verify append by querying immediately (might show stale data depending on snapshot timing)
+        # result = db_conn.execute(f"SELECT * FROM iceberg_scan('{ICEBERG_WAREHOUSE_PATH}/{ICEBERG_CATALOG_NAME}.email_facts') WHERE id = ?", [fact_data['id']]).fetchall()
+        # print(f"Verification query result: {result}")
+
+        return {"message": "Fact added successfully"}
+    except Exception as e:
+        print(f"Error appending data: {e}")
+        # Attempt to get more specific DuckDB error if possible
+        try:
+            duckdb_error = db_conn.last_error() # Check if DuckDB has a specific error
+            if duckdb_error:
+                print(f"DuckDB specific error: {duckdb_error}")
+        except:
+            pass # Ignore if last_error isn't available/applicable
+        raise HTTPException(status_code=500, detail=f"Failed to add fact: {e}")
+
+
+@app.get("/get_fact/{fact_id}")
+async def get_fact(fact_id: str):
+    """Retrieves a fact by its ID using DuckDB iceberg_scan."""
+    if not db_conn:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    # Construct the full table path for iceberg_scan
+    # Path should be warehouse_path/table_name
     table_name = "email_facts"
-    table_location = f"s3://{s3_bucket}/{table_name}"
-    # Check for existence using a key metadata file path
-    metadata_file_path = f"{table_location}/metadata/version-hint.text"
-
-    print(f"Checking for Iceberg table at location: {table_location}")
-    print(f"Using metadata check file: {metadata_file_path}")
+    full_table_path = f"{ICEBERG_WAREHOUSE_PATH}/{table_name}"
+    query = f"SELECT * FROM iceberg_scan('{full_table_path}') WHERE id = ?"
 
     try:
-        if not s3_io.exists(metadata_file_path):
-            print(f"Table metadata not found. Attempting to create table...")
-            # Note: Identifier is less critical without a catalog, location is key
-            table = Table.create(
-                identifier=(table_name,), # Simple identifier
-                schema=iceberg_schema,
-                location=table_location,
-                io=s3_io
-            )
-            print(f"Table created successfully at {table_location}")
+        print(f"Executing query: {query} with param: {fact_id}")
+        result = db_conn.execute(query, [fact_id]).fetchone()
+        print(f"Query result: {result}")
+        if result:
+            # Assuming result columns match schema: (id, fact, source)
+            # Convert result tuple to dict based on schema
+            columns = [field.name for field in iceberg_schema.fields]
+            return dict(zip(columns, result))
         else:
-            print(f"Table metadata found. Loading existing table...")
-            table = Table.load(location=table_location, io=s3_io)
-            print(f"Table loaded successfully from {table_location}")
-            # Optional schema check (remains the same)
-            if str(table.schema().as_struct()) != str(iceberg_schema.as_struct()):
-                 print("WARNING: Existing table schema does not match desired schema!")
-            else:
-                 print("Existing table schema matches.")
-
-    except CommitFailedException as e:
-        print(f"Error committing Iceberg transaction: {e}")
-        # Handle potential concurrent modification issues if needed
-        raise
+            raise HTTPException(status_code=404, detail="Fact not found")
     except Exception as e:
-        print(f"Error creating/loading table '{table_name}': {e}")
-        raise # Re-raise other critical errors
+        print(f"Error querying fact: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve fact: {e}")
 
-# Call the function to ensure the table exists before DuckDB setup
-ensure_iceberg_table()
+@app.get("/list_facts")
+async def list_facts(limit: int = 10):
+    """Lists facts from the Iceberg table using DuckDB iceberg_scan."""
+    if not db_conn:
+        raise HTTPException(status_code=500, detail="Database not initialized")
 
-# --- DuckDB Connection and Querying --- 
+    # Construct the full table path for iceberg_scan
+    # Path should be warehouse_path/table_name
+    table_name = "email_facts"
+    full_table_path = f"{ICEBERG_WAREHOUSE_PATH}/{table_name}"
+    query = f"SELECT * FROM iceberg_scan('{full_table_path}') LIMIT ?"
 
-# 1) Connect + install/load extensions (Keep this)
-print("Connecting to DuckDB...")
-con = duckdb.connect()
-con.execute("INSTALL httpfs;")
-con.execute("LOAD httpfs;")
-con.execute("INSTALL iceberg;")
-con.execute("LOAD iceberg;")
-
-# 2) Configure your R2 bucket over S3 API (Keep this)
-print("Configuring DuckDB S3 access...")
-con.execute(f"SET s3_endpoint='{os.environ['AWS_S3_ENDPOINT']}';")
-con.execute("SET s3_region='auto';") # Keep 'auto' here for DuckDB if it works
-con.execute(f"SET s3_access_key_id='{os.environ['AWS_ACCESS_KEY_ID']}';")
-con.execute(f"SET s3_secret_access_key='{os.environ['AWS_SECRET_ACCESS_KEY']}';")
-con.execute("SET s3_use_ssl=true;")
-
-# 3) Create the table (REMOVE THIS SECTION - PyIceberg handles it now)
-# # Build the SQL string without f-string for main part
-# s3_bucket = os.environ["AWS_S3_BUCKET"]
-# sql_base = """ ... """
-# sql_location = f"LOCATION 's3://{s3_bucket}/email_facts'"
-# create_table_sql = sql_base + sql_location
-# 
-# # Print the SQL for debugging
-# print("--- Executing SQL ---")
-# print(create_table_sql)
-# print("---------------------")
-# # Execute the constructed SQL string
-# con.execute(create_table_sql) # <<< REMOVED
-
-
-@app.get("/")
-def health():
-    # Now query the table managed by Iceberg
-    # DuckDB might need the full S3 path or catalog identifier depending on version/setup
-    # Try querying via S3 path first, assuming DuckDB's iceberg ext can find it
-    table_identifier_for_query = f"'s3://{os.environ['AWS_S3_BUCKET']}/email_facts'"
-    print(f"Querying count from {table_identifier_for_query}...")
     try:
-        cnt = con.execute(f"SELECT count(*) FROM iceberg_scan({table_identifier_for_query})").fetchone()[0]
-        print(f"Row count: {cnt}")
-        return {"status": "OK", "rows": cnt}
+        print(f"Executing query: {query} with limit: {limit}")
+        results = db_conn.execute(query, [limit]).fetchall()
+        print(f"Query results count: {len(results)}")
+        if results:
+            columns = [field.name for field in iceberg_schema.fields]
+            return [dict(zip(columns, row)) for row in results]
+        else:
+            return []
     except Exception as e:
-        print(f"Error querying table: {e}")
-        return {"status": "ERROR", "error": str(e)}
+        print(f"Error listing facts: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list facts: {e}")
+
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    if db_conn and email_facts_table:
+        # Basic check: Can we access table metadata?
+        try:
+            _ = email_facts_table.schema()
+            _ = email_facts_table.spec()
+            _ = email_facts_table.current_snapshot() # Check if snapshot exists (table not empty/corrupt)
+            return {"status": "ok", "message": "Service is healthy, DB connection active, table accessible"}
+        except Exception as e:
+            print(f"Health check failed during table access: {e}")
+            return {"status": "degraded", "message": f"Service might be unhealthy, DB connected but table access error: {e}"}
+    elif db_conn:
+            return {"status": "degraded", "message": "DB connected, but Iceberg table object is not initialized."}
+    else:
+            return {"status": "unhealthy", "message": "DB connection failed on startup."}
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    import uvicorn
+    # Check if running in Docker or locally for host binding
+    host = os.getenv("DOCKER_HOST", "127.0.0.1") # Default to localhost if not in Docker
+    uvicorn.run(app, host=host, port=8000)

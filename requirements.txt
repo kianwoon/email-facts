@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pyiceberg[s3fs,pyarrow]
+duckdb>=0.10.0
+python-dotenv 
