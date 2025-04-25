@@ -1,5 +1,8 @@
 fastapi
 uvicorn[standard]
-pyiceberg[s3fs,pyarrow,sql-sqlite]
+# pyiceberg[s3fs,pyarrow,sql-sqlite]
 duckdb==1.2.2
 python-dotenv 
+# in pyiceberg/catalog/rest.py
+pyiceberg[s3fs,hive]>=0.9.0
+#pyiceberg[pyarrow,s3fs]>=0.14.1
