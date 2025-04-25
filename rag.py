@@ -20,9 +20,9 @@ con.execute(f"SET s3_secret_access_key='{os.environ['AWS_SECRET_ACCESS_KEY']}';"
 con.execute("SET s3_use_ssl=true;")
 
 # 3) Create the table
-# Build the SQL string first
+# Build the SQL string without f-string for main part
 s3_bucket = os.environ["AWS_S3_BUCKET"]
-create_table_sql = f"""
+sql_base = """
 CREATE TABLE IF NOT EXISTS email_facts (
   email_id VARCHAR,
   message_id VARCHAR,
@@ -40,14 +40,23 @@ CREATE TABLE IF NOT EXISTS email_facts (
   detected_pii_types VARCHAR[],
   generated_summary VARCHAR,
   extracted_key_points VARCHAR[],
-  -- extracted_entities column commented out for debugging
+  -- Flattened struct columns
+  extracted_entities_persons VARCHAR[],
+  extracted_entities_organizations VARCHAR[],
+  extracted_entities_locations VARCHAR[],
   intent VARCHAR,
   extraction_method VARCHAR,
   extraction_timestamp TIMESTAMP
 )
 USING iceberg
-LOCATION 's3://{s3_bucket}/email_facts'
 """
+sql_location = f"LOCATION 's3://{s3_bucket}/email_facts'"
+create_table_sql = sql_base + sql_location
+
+# Print the SQL for debugging
+print("--- Executing SQL ---")
+print(create_table_sql)
+print("---------------------")
 # Execute the constructed SQL string
 con.execute(create_table_sql)
 
